@@ -23,9 +23,9 @@ diverges from it. Guiding principle: **ridiculous simplicity, YAGNI.**
 
 ## Layout
 
-- `src/fs.ts` — `VirtualFs`: stamp/normalize/hydrate/read/write/ls over S3 (the whole persistence layer)
+- `src/store/fs.ts` — `VirtualFs`: normalize/read/write/ls over S3, listing fresh per call (the whole persistence layer)
 - `src/tools.ts` — Pi tools (`defineTool`) `read`/`write`/`ls`/`jq`, registered under the built-in names
-- `src/agent.ts` — readline REPL harness: S3 client → per-chat hydrate → session
+- `src/agent.ts` — readline REPL harness: S3 client → per-chat `VirtualFs` → session
 
 Requires the `jq` binary on PATH (the `jq` tool is a dummy `execFile` wrapper).
 
@@ -37,5 +37,5 @@ the API.
 
 - S3 key = `{chat_id}/{path}@{timestamp}`; timestamp is fixed-width UTC so
   lexical sort == chronological. Writes never overwrite (versioning is free).
-- `normalize()` in `src/fs.ts` is cosmetic (one key per logical path), **not**
+- `normalize()` in `src/store/fs.ts` is cosmetic (one key per logical path), **not**
   a security boundary — S3 keys are opaque, there is no real FS to escape.

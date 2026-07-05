@@ -15,7 +15,7 @@ path, return bytes, list. Nothing forces that to be a disk.
   `chat_id`. There is no path outside the chat, so nothing to escape to.
   (S3 keys are opaque strings — `..` is not special, there is no real FS.)
 - **No infra we don't already run.** Just S3. No sandbox, no Postgres.
-- **Durable + resumable.** Any node hydrates any chat by listing a prefix.
+- **Durable + resumable.** Any node serves any chat by listing a prefix.
 
 **Why no Postgres?** `ListObjectsV2` already returns key + size + mtime — that
 *is* the metadata. A metadata DB earns its place only when we need a query S3
@@ -39,70 +39,70 @@ One bucket. Each file version is one object:
   max suffix. Free history, free rollback, no mutation to reason about.
 - **No delete** (YAGNI). If ever needed, a tombstone version.
 
-## The core (`src/fs.ts`)
+## The core (`src/store/fs.ts`)
 
-Hydrate a `path → latestKey` index once from S3 (this is the "hydrate from
-S3"), then serve reads from the index and keep it current on write. No
-content cache — S3 GET is fast and chats are short.
+No in-memory index, no hydrate lifecycle: S3 *is* the state. Every `read`/`ls`
+lists the relevant prefix fresh, so it always sees the true latest — no stale
+index to reconcile, nothing to keep current on write. The fixed-width stamp
+means a lexical sort of the keys under a prefix is already chronological, so
+"latest" is just `.at(-1)`. No content cache — S3 is fast and chats are short.
 
 ```ts
-import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  ListObjectsV2Command,
+} from "@aws-sdk/client-s3";
 
-/** Fixed-width UTC stamp: lexical order == chronological order. */
-function stamp(): string {
+/** Fixed-width UTC stamp, so lexical order == chronological order. */
+function timestamp(): string {
   return new Date().toISOString().replace(/[-:.TZ]/g, ""); // "20260705120000000"
 }
 
-/** Cosmetic only (no real FS to escape): one canonical key per logical path. */
+/** Cosmetic only — one canonical key per logical path. Not a security boundary. */
 function normalize(path: string): string {
-  return path.replace(/\/+/g, "/").replace(/^\/|\/$/g, ""); // 'notes/plan.md'
+  return path.replace(/\/+/g, "/").replace(/^\/|\/$/g, ""); // "notes/plan.md"
 }
 
 export class VirtualFs {
-  private latest = new Map<string, string>(); // path -> newest S3 key
-
-  private constructor(
+  constructor(
     private readonly chatId: string,
     private readonly s3: S3Client,
     private readonly bucket: string,
   ) {}
 
-  /** One prefix listing; builds the latest-version index. */
-  static async hydrate(chatId: string, s3: S3Client, bucket: string) {
-    const fs = new VirtualFs(chatId, s3, bucket);
+  /** All keys under a prefix, sorted oldest→newest (fixed-width stamp ⇒ lexical == chronological). */
+  private async keysUnder(prefix: string): Promise<string[]> {
+    const keys: string[] = [];
     let token: string | undefined;
     do {
-      const res = await s3.send(new ListObjectsV2Command({
-        Bucket: bucket, Prefix: `${chatId}/`, ContinuationToken: token,
-      }));
-      for (const o of res.Contents ?? []) {
-        const key = o.Key!;
-        const path = key.slice(chatId.length + 1, key.lastIndexOf("@"));
-        const prev = fs.latest.get(path);
-        if (!prev || key > prev) fs.latest.set(path, key); // lexical max == newest
-      }
+      const res = await this.s3.send(
+        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: token }),
+      );
+      for (const o of res.Contents ?? []) keys.push(o.Key!);
       token = res.IsTruncated ? res.NextContinuationToken : undefined;
     } while (token);
-    return fs;
+    return keys.sort();
   }
 
   async read(path: string): Promise<string> {
-    const key = this.latest.get(normalize(path));
+    const key = (await this.keysUnder(`${this.chatId}/${normalize(path)}@`)).at(-1); // newest
     if (!key) throw new Error(`ENOENT: ${path}`);
     const res = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
     return res.Body!.transformToString();
   }
 
-  /** New timestamped version; index points at it. Old versions untouched. */
+  /** New timestamped version. Old versions untouched. */
   async write(path: string, content: string): Promise<void> {
-    const p = normalize(path);
-    const key = `${this.chatId}/${p}@${stamp()}`;
+    const key = `${this.chatId}/${normalize(path)}@${timestamp()}`;
     await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: content }));
-    this.latest.set(p, key);
   }
 
-  ls(): string[] {
-    return [...this.latest.keys()].sort();
+  async ls(): Promise<string[]> {
+    const keys = await this.keysUnder(`${this.chatId}/`);
+    const paths = new Set(keys.map((k) => k.slice(this.chatId.length + 1, k.lastIndexOf("@"))));
+    return [...paths].sort();
   }
 }
 ```
@@ -178,7 +178,7 @@ export function tools(vfs: VirtualFs) {
 
 `pi-dev-agent`-style readline REPL. Build the S3 client (dedicated `S3_*`
 creds so MinIO doesn't clobber the AWS chain Bedrock uses — see `.env.sample`),
-hydrate, wire the session.
+build the `VirtualFs`, wire the session.
 
 ```ts
 const s3 = new S3Client({
@@ -194,7 +194,7 @@ const chatId = process.argv.includes("--chat")
   ? process.argv[process.argv.indexOf("--chat") + 1]
   : "default";
 
-const vfs = await VirtualFs.hydrate(chatId, s3, process.env.S3_BUCKET!);
+const vfs = new VirtualFs(chatId, s3, process.env.S3_BUCKET!);
 
 const { session } = await createAgentSession({
   model,
@@ -209,10 +209,10 @@ const { session } = await createAgentSession({
 
 ## Concurrency
 
-One live session per chat is the assumption. Two concurrent sessions each
-keep their own index; both write non-colliding timestamped versions, and a
-re-`hydrate` reconciles to the true latest. Nothing corrupts — worst case a
-session's in-memory index is briefly behind S3.
+Nothing to reconcile: there is no in-memory index, so every read/ls already
+reflects S3. Two concurrent sessions on the same chat both write non-colliding
+timestamped versions, and each subsequent read sees the true latest. Nothing
+corrupts.
 
 ## Deliberately not doing (YAGNI)
 
@@ -224,9 +224,9 @@ session's in-memory index is briefly behind S3.
 
 ## What to materialize, in order
 
-1. `src/fs.ts` — `VirtualFs` (stamp, normalize, hydrate, read, write, ls).
+1. `src/store/fs.ts` — `VirtualFs` (timestamp, normalize, read, write, ls).
 2. `src/tools.ts` — the four tools.
-3. `src/agent.ts` — S3 client + hydrate + session + REPL.
+3. `src/agent.ts` — S3 client + `VirtualFs` + session + REPL.
 
 Test path: `docker compose up -d minio createbuckets`, then
 `npm start -- --chat demo` → write a file, restart, read it back; write it

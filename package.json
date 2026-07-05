@@ -9,6 +9,7 @@
     "start": "tsx src/agent.ts",
     "build": "tsc && chmod +x dist/agent.js",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/fs.test.ts",
     "format": "prettier --write ."
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "@earendil-works/pi-coding-agent": "^0.80.3"
   },
   "devDependencies": {
+    "@types/node": "^26.1.0",
     "prettier": "^3.8.3",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3"
