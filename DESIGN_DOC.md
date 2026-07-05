@@ -255,9 +255,25 @@ export function s3BlobStore(client: S3Client, bucket: string): BlobStore {
 }
 ```
 
-For local dev, point the same client at MinIO/localstack via `S3_ENDPOINT` +
-`forcePathStyle` (see `.env.sample`). An `InMemoryBlobStore` (a `Map`) makes
-tests need no infra at all.
+The `S3Client` is built in `agent.ts` with **dedicated** `S3_*` credentials
+(endpoint + `forcePathStyle` + access keys), kept separate from the default
+AWS chain that Bedrock uses — otherwise MinIO's keys would clobber Bedrock's.
+Leave `S3_ENDPOINT`/`S3_ACCESS_KEY_ID` unset for real AWS S3 and the client
+falls back to the default chain. `docker compose up` (see `docker-compose.yml`)
+gives you MinIO + the bucket; an `InMemoryBlobStore` (a `Map`) makes tests
+need no infra at all.
+
+```ts
+// agent.ts — S3 client wiring
+const s3 = new S3Client({
+  region: process.env.S3_REGION,
+  endpoint: process.env.S3_ENDPOINT || undefined,          // MinIO for local dev
+  forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
+  credentials: process.env.S3_ACCESS_KEY_ID
+    ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY! }
+    : undefined,                                            // else default AWS chain (real S3)
+});
+```
 
 ## Wiring into the Pi session (`src/tools.ts`, `src/agent.ts`)
 

@@ -24,5 +24,35 @@ services:
       timeout: 3s
       retries: 5
 
+  minio:
+    # VFS blob store (S3-compatible). Console at http://localhost:9001.
+    image: minio/minio:RELEASE.2025-05-24T17-08-30Z
+    environment:
+      MINIO_ROOT_USER: minio_key
+      MINIO_ROOT_PASSWORD: minio_secret_key
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - miniodata:/data
+    ports:
+      - 127.0.0.1:${MINIO_PORT-9000}:9000
+      - 127.0.0.1:${MINIO_CONSOLE_PORT-9001}:9001
+
+  createbuckets:
+    # One-shot: waits for MinIO, then creates the VFS bucket. Exits 0.
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      S3_BUCKET: ${S3_BUCKET-pi-memfs-dev}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minio_key minio_secret_key; do
+        echo 'Waiting for MinIO...'; sleep 1;
+      done;
+      mc mb --ignore-existing local/$${S3_BUCKET};
+      echo 'Bucket ready: '$${S3_BUCKET};
+      "
+
 volumes:
   pgdata:
+  miniodata:
