@@ -245,9 +245,22 @@ const { session } = await createAgentSession({
 ## Concurrency
 
 Nothing to reconcile: there is no in-memory index, so every read/ls already
-reflects S3. Two concurrent sessions on the same chat both write non-colliding
-timestamped versions, and each subsequent read sees the true latest. Nothing
-corrupts.
+reflects S3. Concurrent sessions on the same chat write timestamped versions
+and each subsequent read sees the latest. Nothing corrupts.
+
+Assumptions (deliberate, not bugs):
+
+- **Not designed for sub-millisecond concurrency under one `chat_id`.** The
+  version key is a millisecond-precision timestamp, so two writes to the _same
+  path_ in the _same millisecond_ under the _same chat_ produce the identical
+  key and the second silently wins. We assume a single logical writer per chat
+  and do not defend against a write-write race that tight. (If that ever
+  changes, add a uniquifier or move to native S3 versioning — roadmap item 2.)
+- **`chat_id` is assumed unique and server-generated.** It is the namespace
+  boundary between chats; the app embedding this workspace owns minting it
+  (unique, no `/`). We do not validate it here — a colliding or slash-bearing
+  id would alias namespaces, and that is the caller's contract to uphold
+  (roadmap item 3).
 
 ## Deliberately not doing (YAGNI)
 
