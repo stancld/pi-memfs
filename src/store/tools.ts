@@ -1,34 +1,40 @@
 import { Type } from "typebox";
-import { defineTool } from "@earendil-works/pi-coding-agent";
+import {
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  defineTool,
+} from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { relative } from "node:path";
 import type { VirtualFs } from "./fs.js";
 
 const run = promisify(execFile);
 
+// The native read/write tools resolve a path against a cwd, then hand the
+// absolute path to our operations. Nothing real lives at this sentinel root,
+// so their FS probes all miss and we map straight back to a workspace path.
+const WORKSPACE_ROOT = "/workspace";
+const wsPath = (absolutePath: string) => relative(WORKSPACE_ROOT, absolutePath);
+
 export function tools(vfs: VirtualFs) {
-  const read = defineTool({
-    name: "read",
-    label: "Read",
-    description: "Read a file from the workspace",
-    parameters: Type.Object({ path: Type.String() }),
-    execute: async (_id, { path }) => ({
-      content: [{ type: "text", text: await vfs.read(path) }],
-      details: {},
-    }),
+  // Native read tool (offset/limit + 2000-line/50KB truncation) over the
+  // in-memory workspace instead of disk — no wheel reinvented.
+  const read = createReadToolDefinition(WORKSPACE_ROOT, {
+    autoResizeImages: false,
+    operations: {
+      readFile: async (abs) =>
+        Buffer.from(await vfs.read(wsPath(abs)), "utf-8"),
+      access: async () => {}, // missing files surface as ENOENT from vfs.read
+      detectImageMimeType: async () => null, // workspace is text/JSON only
+    },
   });
 
-  const write = defineTool({
-    name: "write",
-    label: "Write",
-    description: "Create or overwrite a file in the workspace",
-    parameters: Type.Object({ path: Type.String(), content: Type.String() }),
-    execute: async (_id, { path, content }) => {
-      await vfs.write(path, content);
-      return {
-        content: [{ type: "text", text: `Wrote ${path}` }],
-        details: {},
-      };
+  // Native write tool over the workspace. Flat keyspace → mkdir is a no-op.
+  const write = createWriteToolDefinition(WORKSPACE_ROOT, {
+    operations: {
+      writeFile: async (abs, content) => vfs.write(wsPath(abs), content),
+      mkdir: async () => {},
     },
   });
 

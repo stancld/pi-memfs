@@ -13,6 +13,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import {
   createAgentSession,
   SessionManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { VirtualFs } from "./store/fs.js";
@@ -52,7 +53,9 @@ const { session } = await createAgentSession({
   model,
   sessionManager: SessionManager.inMemory(),
   noTools: "builtin", // no real-FS tools, no bash — the whole point
-  customTools: Object.values(tools(vfs)),
+  // Cast: the tools have heterogeneous ToolDefinition generics, so the union
+  // from Object.values doesn't collapse under strict function variance.
+  customTools: Object.values(tools(vfs)) as ToolDefinition[],
   tools: ["read", "write", "ls", "jq"],
 });
 

@@ -42,13 +42,37 @@ test("write → ls → read round-trip", async () => {
 
   assert.equal(await text(t.ls, {}), "(empty)");
 
-  assert.equal(
-    await text(t.write, { path: "notes/plan.md", content: "hello" }),
-    "Wrote notes/plan.md",
-  );
+  await text(t.write, { path: "notes/plan.md", content: "hello" });
 
   assert.equal(await text(t.ls, {}), "notes/plan.md");
   assert.equal(await text(t.read, { path: "notes/plan.md" }), "hello");
+});
+
+test("read truncates a long file with a continue hint (native truncation)", async () => {
+  const t = freshTools();
+  const body = Array.from({ length: 2500 }, (_, i) => `line ${i + 1}`).join(
+    "\n",
+  );
+  await text(t.write, { path: "big.txt", content: body });
+
+  const out = await text(t.read, { path: "big.txt" });
+  assert.match(
+    out,
+    /Showing lines 1-2000 of 2500\. Use offset=2001 to continue\./,
+  );
+  assert.ok(!out.includes("line 2001"));
+});
+
+test("read offset continues from a given line", async () => {
+  const t = freshTools();
+  const body = Array.from({ length: 2500 }, (_, i) => `line ${i + 1}`).join(
+    "\n",
+  );
+  await text(t.write, { path: "big.txt", content: body });
+
+  const out = await text(t.read, { path: "big.txt", offset: 2001 });
+  assert.ok(out.startsWith("line 2001"));
+  assert.ok(out.includes("line 2500"));
 });
 
 test("write twice → read returns latest", async () => {
