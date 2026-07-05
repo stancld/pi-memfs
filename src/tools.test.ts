@@ -81,3 +81,20 @@ test("jq on invalid filter → error message, no throw", async () => {
     /jq error:/,
   );
 });
+
+test("jq does not leak host env into subprocess", async () => {
+  const t = freshTools();
+  process.env.PI_MEMFS_LEAK_CANARY = "SECRET123";
+
+  try {
+    await text(t.write, { path: "data.json", content: "{}" });
+    const out = await text(t.jq, {
+      path: "data.json",
+      filter: 'env.PI_MEMFS_LEAK_CANARY // "absent"',
+    });
+    assert.equal(out.trim(), '"absent"');
+    assert.doesNotMatch(out, /SECRET123/);
+  } finally {
+    delete process.env.PI_MEMFS_LEAK_CANARY;
+  }
+});

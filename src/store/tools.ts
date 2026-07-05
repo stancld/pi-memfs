@@ -56,7 +56,10 @@ export function tools(vfs: VirtualFs) {
     execute: async (_id, { path, filter }) => {
       const input = await vfs.read(path);
       try {
-        const proc = run("jq", [filter], { maxBuffer: 32 << 20 });
+        const proc = run("jq", [filter], {
+          env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, // no host env → no cred leak
+          maxBuffer: 32 << 20,
+        });
         proc.child.stdin!.end(input);
         const { stdout } = await proc;
         return { content: [{ type: "text", text: stdout }], details: {} };
