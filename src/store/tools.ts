@@ -57,6 +57,17 @@ export function tools(vfs: VirtualFs) {
     description: "Run a jq filter over a JSON file in the workspace",
     parameters: Type.Object({ path: Type.String(), filter: Type.String() }),
     execute: async (_id, { path, filter }) => {
+      // `import`/`include` are the ONLY way to make jq load host files (its
+      // module search path is attacker-controllable via `{search:...}`), and
+      // they cannot be spelled any other way in the jq grammar — so a
+      // word-boundary reject fully closes the host-file-read vector.
+      if (/\b(?:import|include)\b/.test(filter))
+        return {
+          content: [
+            { type: "text", text: "jq error: module imports are disabled" },
+          ],
+          details: {},
+        };
       const input = await vfs.read(path);
       try {
         const proc = run("jq", [filter], {

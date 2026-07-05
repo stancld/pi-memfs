@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { S3Client } from "@aws-sdk/client-s3";
 import { VirtualFs } from "./store/fs";
 import { tools } from "./store/tools";
@@ -104,6 +107,28 @@ test("jq on invalid filter → error message, no throw", async () => {
     await text(t.jq, { path: "data.json", filter: ".[" }),
     /jq error:/,
   );
+});
+
+test("jq cannot read host files via module import", async () => {
+  const t = freshTools();
+
+  // A secret .json file sitting anywhere on the host filesystem.
+  const dir = mkdtempSync(join(tmpdir(), "pi-memfs-leak-"));
+  writeFileSync(join(dir, "creds.json"), '{"host_secret":"SECRET123"}');
+
+  try {
+    await text(t.write, { path: "data.json", content: "{}" });
+    // jq's module system honours an inline, attacker-controlled search path,
+    // so `import "<name>" as $x {search:"<dir>"}` slurps <dir>/<name>.json off
+    // the HOST fs — bypassing chat_id scoping entirely.
+    const out = await text(t.jq, {
+      path: "data.json",
+      filter: `import "creds" as $c {search:"${dir}"}; $c`,
+    });
+    assert.doesNotMatch(out, /SECRET123/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("jq does not leak host env into subprocess", async () => {
