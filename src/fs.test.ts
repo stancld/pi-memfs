@@ -48,3 +48,10 @@ test("write twice → latest wins", async () => {
   assert.deepEqual(await vfs.ls(), ["notes/plan.md"]);
   assert.equal(await vfs.read("notes/plan.md"), "hello new");
 });
+
+test("path containing @ is rejected (reserved version delimiter)", async () => {
+  const vfs = new VirtualFs(randomUUID(), s3, bucket);
+
+  await assert.rejects(() => vfs.write("plan.md@x", "boom"), /@/);
+  await assert.rejects(() => vfs.read("plan.md@x"), /@/);
+});

@@ -12,6 +12,8 @@ function timestamp(): string {
 
 /** Cosmetic only — one canonical key per logical path. Not a security boundary. */
 function normalize(path: string): string {
+  if (path.includes("@"))
+    throw new Error(`invalid path (@ is reserved): ${path}`);
   return path.replace(/\/+/g, "/").replace(/^\/|\/$/g, ""); // "notes/plan.md"
 }
 
