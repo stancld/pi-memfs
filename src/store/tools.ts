@@ -59,8 +59,9 @@ export function tools(vfs: VirtualFs) {
         const proc = run("jq", [filter], {
           env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, // no host env → no cred leak
           maxBuffer: 32 << 20,
-          timeout: 10_000, // #1: kill a runaway filter (e.g. `repeat(.)`) instead of hanging the turn
+          timeout: 10_000, // kill a runaway filter (e.g. `repeat(.)`) instead of hanging the turn
         });
+        proc.child.stdin!.on("error", () => {}); // swallow EPIPE when jq exits before its input is fully written
         proc.child.stdin!.end(input);
         const { stdout } = await proc;
         return { content: [{ type: "text", text: stdout }], details: {} };
