@@ -121,10 +121,11 @@ export class VirtualFs {
 
 That's the whole persistence layer. ~55 LoC.
 
-## Tools (`src/tools.ts`)
+## Tools (`src/store/tools.ts`)
 
 Four tools, registered under the built-in names (so the model's priors carry
-over) plus `jq`. Built-ins disabled via `noTools: "builtin"`.
+over) plus `jq`. Built-ins disabled via `noTools: "builtin"`. `grep` (text
+search over latest versions) is the planned fifth — see the roadmap at the end.
 
 ```ts
 import { Type } from "typebox";
@@ -167,7 +168,9 @@ export function tools(vfs: VirtualFs) {
     description: "List files in the workspace",
     parameters: Type.Object({}),
     execute: async () => ({
-      content: [{ type: "text", text: vfs.ls().join("\n") || "(empty)" }],
+      content: [
+        { type: "text", text: (await vfs.ls()).join("\n") || "(empty)" },
+      ],
       details: {},
     }),
   });
@@ -183,10 +186,10 @@ export function tools(vfs: VirtualFs) {
     execute: async (_id, { path, filter }) => {
       const input = await vfs.read(path);
       try {
-        const { stdout } = await run("jq", [filter], {
-          input,
-          maxBuffer: 32 << 20,
-        });
+        // promisify(execFile) has no `input` option — pipe via child.stdin.
+        const proc = run("jq", [filter], { maxBuffer: 32 << 20 });
+        proc.child.stdin!.end(input);
+        const { stdout } = await proc;
         return { content: [{ type: "text", text: stdout }], details: {} };
       } catch (e: any) {
         return {
@@ -249,17 +252,38 @@ corrupts.
 ## Deliberately not doing (YAGNI)
 
 - **Postgres / a metadata DB** — `ListObjectsV2` is the metadata.
-- **`edit` / `grep` / `find`** — `read` + `write` + `ls` cover a small
-  workspace; `jq` covers structured JSON (the Rossum case). Add `edit` back
-  the day whole-file rewrites cost too many tokens.
+- **`edit` / `find`** — `read` + `write` + `ls` cover a small workspace;
+  `jq` + `grep` cover structured JSON and text search (the Rossum case). Add
+  `edit` back the day whole-file rewrites cost too many tokens. (`grep` is
+  in scope but not yet built — it is the documented fallback for the Rossum
+  search skill; see the roadmap.)
 - **Delete, content cache, dedup, content-addressing, dir-tree synthesis.**
 
 ## What to materialize, in order
 
-1. `src/store/fs.ts` — `VirtualFs` (timestamp, normalize, read, write, ls).
-2. `src/tools.ts` — the four tools.
-3. `src/agent.ts` — S3 client + `VirtualFs` + session + REPL.
+1. `src/store/fs.ts` — `VirtualFs` (timestamp, normalize, read, write, ls). ✅
+2. `src/store/tools.ts` — the four tools (`read`/`write`/`ls`/`jq`). ✅
+3. `src/agent.ts` — S3 client + `VirtualFs` + session + REPL. ✅ (currently
+   hard-wired to MinIO + Bedrock haiku for the local leak test).
 
 Test path: `docker compose up -d minio createbuckets`, then
 `npm start -- --chat demo` → write a file, restart, read it back; write it
 again and confirm a second timestamped object appears in the bucket.
+
+## Roadmap (hardening, before this is production-shaped)
+
+Ordered by what unblocks the go/no-go test against elis-couper:
+
+1. **Harden `jq`** — run with an empty env (`env: {}`), a wall-clock
+   `timeout`, and a capped output. Today the subprocess inherits the host env
+   (AWS creds) and can run unbounded; that is the one place the "no shell, so
+   nothing to isolate" argument leaks.
+2. **Fix versioning** — the `@timestamp` scheme collides on same-millisecond
+   writes and lets a literal `@` in a path shadow another file. Prefer native
+   S3 object versioning (latest = one `GET`, history = `ListObjectVersions`);
+   or, if keeping the scheme, add a uniquifier and reject `@` in `normalize()`.
+3. **Treat `chat_id` as a server-generated, validated id** (no `/`), not raw
+   client input — the prefix is a namespace convention, not yet a boundary.
+4. **Add `grep` + `read` truncation + a shared read-only snapshot prefix**,
+   then port the Rossum search skill and run elis-couper's read-only corpus.
+   That is the real go/no-go test.
