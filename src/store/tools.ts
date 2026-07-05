@@ -70,11 +70,19 @@ export function tools(vfs: VirtualFs) {
         };
       const input = await vfs.read(path);
       try {
-        const proc = run("jq", [filter], {
-          env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, // no host env → no cred leak
-          maxBuffer: 32 << 20,
-          timeout: 10_000, // kill a runaway filter (e.g. `repeat(.)`) instead of hanging the turn
-        });
+        // `ulimit -v` caps address space at 10 MB (KB units; enforced on Linux,
+        // a no-op on macOS, fine for local dev) so a filter like `[range(1e9)]`
+        // balloons the child instead of OOMing the host. The filter is a
+        // positional arg ($1), never interpolated, so /bin/sh adds no injection.
+        const proc = run(
+          "/bin/sh",
+          ["-c", `ulimit -v ${10 * 1024}; exec jq "$@"`, "sh", filter],
+          {
+            env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, // no host env → no cred leak
+            maxBuffer: 32 << 20,
+            timeout: 10_000, // kill a runaway filter (e.g. `repeat(.)`) instead of hanging the turn
+          },
+        );
         proc.child.stdin!.on("error", () => {}); // swallow EPIPE when jq exits before its input is fully written
         proc.child.stdin!.end(input);
         const { stdout } = await proc;
