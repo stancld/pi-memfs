@@ -9,7 +9,7 @@
     "start": "tsx src/agent.ts",
     "build": "tsc && chmod +x dist/agent.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test src/fs.test.ts",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
     "format": "prettier --write .",
     "prepare": "husky"
   },

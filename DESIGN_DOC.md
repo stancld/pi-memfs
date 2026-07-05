@@ -18,7 +18,7 @@ path, return bytes, list. Nothing forces that to be a disk.
 - **Durable + resumable.** Any node serves any chat by listing a prefix.
 
 **Why no Postgres?** `ListObjectsV2` already returns key + size + mtime — that
-*is* the metadata. A metadata DB earns its place only when we need a query S3
+_is_ the metadata. A metadata DB earns its place only when we need a query S3
 can't do (cross-chat search, joins, transactions). We don't. YAGNI. Add it
 the day a query needs it.
 
@@ -41,7 +41,7 @@ One bucket. Each file version is one object:
 
 ## The core (`src/store/fs.ts`)
 
-No in-memory index, no hydrate lifecycle: S3 *is* the state. Every `read`/`ls`
+No in-memory index, no hydrate lifecycle: S3 _is_ the state. Every `read`/`ls`
 lists the relevant prefix fresh, so it always sees the true latest — no stale
 index to reconcile, nothing to keep current on write. The fixed-width stamp
 means a lexical sort of the keys under a prefix is already chronological, so
@@ -78,7 +78,11 @@ export class VirtualFs {
     let token: string | undefined;
     do {
       const res = await this.s3.send(
-        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: token }),
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+        }),
       );
       for (const o of res.Contents ?? []) keys.push(o.Key!);
       token = res.IsTruncated ? res.NextContinuationToken : undefined;
@@ -87,21 +91,29 @@ export class VirtualFs {
   }
 
   async read(path: string): Promise<string> {
-    const key = (await this.keysUnder(`${this.chatId}/${normalize(path)}@`)).at(-1); // newest
+    const key = (await this.keysUnder(`${this.chatId}/${normalize(path)}@`)).at(
+      -1,
+    ); // newest
     if (!key) throw new Error(`ENOENT: ${path}`);
-    const res = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+    const res = await this.s3.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
     return res.Body!.transformToString();
   }
 
   /** New timestamped version. Old versions untouched. */
   async write(path: string, content: string): Promise<void> {
     const key = `${this.chatId}/${normalize(path)}@${timestamp()}`;
-    await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: content }));
+    await this.s3.send(
+      new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: content }),
+    );
   }
 
   async ls(): Promise<string[]> {
     const keys = await this.keysUnder(`${this.chatId}/`);
-    const paths = new Set(keys.map((k) => k.slice(this.chatId.length + 1, k.lastIndexOf("@"))));
+    const paths = new Set(
+      keys.map((k) => k.slice(this.chatId.length + 1, k.lastIndexOf("@"))),
+    );
     return [...paths].sort();
   }
 }
@@ -125,30 +137,38 @@ const run = promisify(execFile);
 
 export function tools(vfs: VirtualFs) {
   const read = defineTool({
-    name: "read", label: "Read",
+    name: "read",
+    label: "Read",
     description: "Read a file from the workspace",
     parameters: Type.Object({ path: Type.String() }),
     execute: async (_id, { path }) => ({
-      content: [{ type: "text", text: await vfs.read(path) }], details: {},
+      content: [{ type: "text", text: await vfs.read(path) }],
+      details: {},
     }),
   });
 
   const write = defineTool({
-    name: "write", label: "Write",
+    name: "write",
+    label: "Write",
     description: "Create or overwrite a file in the workspace",
     parameters: Type.Object({ path: Type.String(), content: Type.String() }),
     execute: async (_id, { path, content }) => {
       await vfs.write(path, content);
-      return { content: [{ type: "text", text: `Wrote ${path}` }], details: {} };
+      return {
+        content: [{ type: "text", text: `Wrote ${path}` }],
+        details: {},
+      };
     },
   });
 
   const ls = defineTool({
-    name: "ls", label: "List",
+    name: "ls",
+    label: "List",
     description: "List files in the workspace",
     parameters: Type.Object({}),
     execute: async () => ({
-      content: [{ type: "text", text: vfs.ls().join("\n") || "(empty)" }], details: {},
+      content: [{ type: "text", text: vfs.ls().join("\n") || "(empty)" }],
+      details: {},
     }),
   });
 
@@ -156,21 +176,30 @@ export function tools(vfs: VirtualFs) {
   // execFile (no shell) + a single trusted binary + arg array => no injection.
   // Input is workspace content piped on stdin. Requires `jq` on PATH.
   const jq = defineTool({
-    name: "jq", label: "jq",
+    name: "jq",
+    label: "jq",
     description: "Run a jq filter over a JSON file in the workspace",
     parameters: Type.Object({ path: Type.String(), filter: Type.String() }),
     execute: async (_id, { path, filter }) => {
       const input = await vfs.read(path);
       try {
-        const { stdout } = await run("jq", [filter], { input, maxBuffer: 32 << 20 });
+        const { stdout } = await run("jq", [filter], {
+          input,
+          maxBuffer: 32 << 20,
+        });
         return { content: [{ type: "text", text: stdout }], details: {} };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `jq error: ${e.stderr || e.message}` }], details: {} };
+        return {
+          content: [
+            { type: "text", text: `jq error: ${e.stderr || e.message}` },
+          ],
+          details: {},
+        };
       }
     },
   });
 
-  return [read, write, ls, jq];
+  return { read, write, ls, jq };
 }
 ```
 
@@ -183,11 +212,14 @@ build the `VirtualFs`, wire the session.
 ```ts
 const s3 = new S3Client({
   region: process.env.S3_REGION,
-  endpoint: process.env.S3_ENDPOINT || undefined,          // MinIO for local dev
+  endpoint: process.env.S3_ENDPOINT || undefined, // MinIO for local dev
   forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
   credentials: process.env.S3_ACCESS_KEY_ID
-    ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY! }
-    : undefined,                                            // else default AWS chain
+    ? {
+        accessKeyId: process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY!,
+      }
+    : undefined, // else default AWS chain
 });
 
 const chatId = process.argv.includes("--chat")
@@ -200,8 +232,8 @@ const { session } = await createAgentSession({
   model,
   resourceLoader,
   sessionManager: SessionManager.inMemory(),
-  noTools: "builtin",                    // no real-FS tools, no bash — the whole point
-  customTools: tools(vfs),
+  noTools: "builtin", // no real-FS tools, no bash — the whole point
+  customTools: Object.values(tools(vfs)),
   tools: ["read", "write", "ls", "jq"],
 });
 // subscribe to events + readline loop, as in pi-dev-agent/agent.ts
