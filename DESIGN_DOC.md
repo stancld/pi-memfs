@@ -1,305 +1,140 @@
-# pi-memfs — an in-memory virtual FS for Pi agents (no sandbox)
+# pi-memfs — a sandbox-free workspace for Pi agents (S3-only)
 
-Experiment: replace sandboxing in `elis-couper` with a **virtual filesystem**.
-The agent gets `read` / `write` / `edit` / `ls` / `grep` / `find` tools that
-operate on an in-memory tree, not the OS filesystem. Persistence is split:
-
-- **Metadata** (tree, paths, sizes, mtimes, blob hashes) → **PostgreSQL**, keyed by `chat_id`
-- **Content** (file bytes) → **S3**, content-addressed per chat
+Experiment: replace sandboxing in `elis-couper` with a virtual filesystem.
+The agent gets `read` / `write` / `ls` / `jq` tools that read and write files
+in **S3, scoped by `chat_id`** — no bash, no containers, no real disk, and
+**no Postgres**. Every write is a new timestamped version; "latest" wins.
 
 ## Why
 
-The only reason `elis-couper` would need a sandbox is `bash` — a real shell
-needs real isolation (containers, seccomp, fs jails …). But we don't need
-bash. Everything else the Pi SDK's file tools do is just an FS *interface*:
-resolve a path, return bytes, list a dir, search. Nothing forces that
-interface to be backed by a disk.
+The only reason to sandbox is `bash` — a real shell needs real isolation. We
+don't need bash. The rest of the file tools are just an interface: resolve a
+path, return bytes, list. Nothing forces that to be a disk.
 
-So instead of isolating the agent *from* the real FS, we never give it one:
+- **Isolation by namespace, not a jail.** Every key is prefixed with
+  `chat_id`. There is no path outside the chat, so nothing to escape to.
+  (S3 keys are opaque strings — `..` is not special, there is no real FS.)
+- **No infra we don't already run.** Just S3. No sandbox, no Postgres.
+- **Durable + resumable.** Any node hydrates any chat by listing a prefix.
 
-- **Isolation by namespace, not by jail.** Every operation keys on `chat_id`.
-  There is no path outside the chat's tree, so there is nothing to escape to.
-- **Zero infra for isolation.** No containers, no firecracker, no tmpdir
-  cleanup jobs. Postgres and S3 we already run.
-- **Durable + resumable for free.** A chat's workspace survives process
-  restarts and horizontal scaling — any server node can hydrate any chat.
-- **Auditable.** Every file version is a content-addressed blob; the DB is a
-  log of what the agent did to the workspace.
+**Why no Postgres?** `ListObjectsV2` already returns key + size + mtime — that
+*is* the metadata. A metadata DB earns its place only when we need a query S3
+can't do (cross-chat search, joins, transactions). We don't. YAGNI. Add it
+the day a query needs it.
 
-What we give up: no arbitrary process execution (that's the point), and file
-tools must be reimplemented as custom Pi tools instead of the built-ins
-(small, see below — the built-ins are thin wrappers over `node:fs` anyway).
+## Layout in S3
 
-## Architecture
+One bucket. Each file version is one object:
 
 ```
-                    Pi SDK session (per chat)
-                    tools: read/write/edit/ls/grep/find (custom, VFS-backed)
-                                  │
-                                  ▼
-                       VirtualFs (in-memory tree)
-                    hydrate on session start ── lazy blob fetch
-                    write-through on mutation
-                     │                                │
-                     ▼                                ▼
-        PostgreSQL: vfs_files              S3: blobs/{chat_id}/{sha256}
-        (path → metadata + blob hash,      (immutable, content-addressed)
-         source of truth for the tree)
+{chat_id}/{path}@{timestamp}
 ```
 
-- **Hydrate**: on session start, one `SELECT` loads the whole tree for
-  `chat_id` — paths + metadata only, no content. Cheap even at thousands of
-  files.
-- **Lazy content**: file bytes are fetched from S3 on first `read` (or
-  `grep`) and cached in memory for the session's lifetime.
-- **Write-through**: every `write`/`edit` uploads the new blob to S3 *first*,
-  then upserts the PG row. A crashed session loses nothing that a tool call
-  reported as done.
+- `timestamp` is **fixed-width and UTC** so a lexicographic sort equals a
+  chronological one (rir's timestamped-handle pattern,
+  `commons/storage/morgan_storage/storage.py::get_latest_timestamped_handle`).
+  e.g. `2026-07-05T12:00:00.000Z` → `20260705120000000`.
+- **Writes never overwrite.** Each write is a new object → the version history
+  is the set of objects sharing a `{chat_id}/{path}@` prefix; "latest" is the
+  max suffix. Free history, free rollback, no mutation to reason about.
+- **No delete** (YAGNI). If ever needed, a tombstone version.
 
-### Consistency between PG and S3
+## The core (`src/fs.ts`)
 
-A write touches two stores; ordering makes this safe without transactions
-spanning both:
-
-1. `PUT s3://bucket/blobs/{chat_id}/{sha256(content)}` — **immutable and
-   idempotent**. Re-uploading the same content is a no-op; nothing ever
-   overwrites a blob with different bytes.
-2. `INSERT ... ON CONFLICT (chat_id, path) DO UPDATE` the metadata row
-   pointing at that hash.
-
-Failure modes:
-- Crash between 1 and 2 → an **orphaned blob**. Harmless; a periodic sweep
-  (or S3 lifecycle rule) can collect blobs not referenced by any row.
-- The reverse (row without blob) **cannot happen** — the row is only written
-  after the blob exists.
-
-PG is the single source of truth for "what files exist"; S3 is a dumb,
-append-only blob store.
-
-### Content addressing
-
-Blob key = `blobs/{chat_id}/{sha256(content)}`.
-
-- Dedup for free (agent rewrites same content → same key, no new upload).
-- Cheap versioning later: keep old `(path, blob_sha)` pairs in a history
-  table and you have point-in-time workspace snapshots without copying bytes.
-- Scoping the key by `chat_id` keeps deletion trivial (drop the prefix) and
-  avoids cross-tenant blob sharing questions. Revisit if dedup across chats
-  ever matters (it won't for a while).
-
-Inline-in-PG alternative (a `bytea` column, skip S3 entirely) is genuinely
-simpler and fine below ~100 KB/file; we go S3 because documents (PDFs, XLSX
-extracts) will blow past that. If the experiment shows files stay tiny,
-collapsing to PG-only is a one-file change (`BlobStore` interface below).
-
-## PostgreSQL schema
-
-```sql
-CREATE TABLE vfs_files (
-  chat_id    text        NOT NULL,
-  path       text        NOT NULL,          -- normalized, absolute, '/'-rooted: '/notes/plan.md'
-  blob_sha   text        NOT NULL,          -- sha256 hex of content; S3 key suffix
-  size       integer     NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (chat_id, path)
-);
-
--- hydrate query is a prefix scan:
---   SELECT path, blob_sha, size, updated_at FROM vfs_files WHERE chat_id = $1;
-```
-
-Notes:
-- **Directories are implicit** (like S3/git): they exist iff a file path has
-  them as a prefix. `ls`/`find` synthesize them in memory. No dir rows, no
-  empty-dir support — acceptable for an agent workspace.
-- Paths are normalized on the way in (`/` root, no `..`, no trailing `/`);
-  the VFS rejects anything that escapes root, which is the entire "sandbox".
-
-## The `VirtualFs` core (`src/vfs.ts`)
-
-Session-lifetime object. Not an abstract POSIX layer — exactly the surface
-the six tools need.
+Hydrate a `path → latestKey` index once from S3 (this is the "hydrate from
+S3"), then serve reads from the index and keep it current on write. No
+content cache — S3 GET is fast and chats are short.
 
 ```ts
-export interface FileMeta {
-  path: string;      // '/notes/plan.md'
-  blobSha: string;
-  size: number;
-  updatedAt: Date;
+import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+
+/** Fixed-width UTC stamp: lexical order == chronological order. */
+function stamp(): string {
+  return new Date().toISOString().replace(/[-:.TZ]/g, ""); // "20260705120000000"
 }
 
-export interface MetaStore {
-  loadTree(chatId: string): Promise<FileMeta[]>;
-  upsert(chatId: string, meta: FileMeta): Promise<void>;
-  remove(chatId: string, path: string): Promise<void>;
-}
-
-export interface BlobStore {
-  get(chatId: string, sha: string): Promise<Uint8Array>;
-  put(chatId: string, sha: string, content: Uint8Array): Promise<void>;
+/** Cosmetic only (no real FS to escape): one canonical key per logical path. */
+function normalize(path: string): string {
+  return path.replace(/\/+/g, "/").replace(/^\/|\/$/g, ""); // 'notes/plan.md'
 }
 
 export class VirtualFs {
-  private tree = new Map<string, FileMeta>();     // path → meta
-  private cache = new Map<string, string>();      // blobSha → decoded content
+  private latest = new Map<string, string>(); // path -> newest S3 key
 
   private constructor(
     private readonly chatId: string,
-    private readonly meta: MetaStore,
-    private readonly blobs: BlobStore,
+    private readonly s3: S3Client,
+    private readonly bucket: string,
   ) {}
 
-  /** One PG query; no S3 traffic. */
-  static async hydrate(chatId: string, meta: MetaStore, blobs: BlobStore) {
-    const fs = new VirtualFs(chatId, meta, blobs);
-    for (const f of await meta.loadTree(chatId)) fs.tree.set(f.path, f);
+  /** One prefix listing; builds the latest-version index. */
+  static async hydrate(chatId: string, s3: S3Client, bucket: string) {
+    const fs = new VirtualFs(chatId, s3, bucket);
+    let token: string | undefined;
+    do {
+      const res = await s3.send(new ListObjectsV2Command({
+        Bucket: bucket, Prefix: `${chatId}/`, ContinuationToken: token,
+      }));
+      for (const o of res.Contents ?? []) {
+        const key = o.Key!;
+        const path = key.slice(chatId.length + 1, key.lastIndexOf("@"));
+        const prev = fs.latest.get(path);
+        if (!prev || key > prev) fs.latest.set(path, key); // lexical max == newest
+      }
+      token = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (token);
     return fs;
   }
 
   async read(path: string): Promise<string> {
-    const f = this.tree.get(normalize(path));
-    if (!f) throw new Error(`ENOENT: ${path}`);
-    let content = this.cache.get(f.blobSha);
-    if (content === undefined) {
-      content = new TextDecoder().decode(await this.blobs.get(this.chatId, f.blobSha));
-      this.cache.set(f.blobSha, content);
-    }
-    return content;
+    const key = this.latest.get(normalize(path));
+    if (!key) throw new Error(`ENOENT: ${path}`);
+    const res = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+    return res.Body!.transformToString();
   }
 
-  /** Blob first, then metadata — see "Consistency" above. */
+  /** New timestamped version; index points at it. Old versions untouched. */
   async write(path: string, content: string): Promise<void> {
     const p = normalize(path);
-    const bytes = new TextEncoder().encode(content);
-    const sha = await sha256hex(bytes);
-    await this.blobs.put(this.chatId, sha, bytes);        // idempotent
-    const meta: FileMeta = { path: p, blobSha: sha, size: bytes.length, updatedAt: new Date() };
-    await this.meta.upsert(this.chatId, meta);            // source of truth
-    this.tree.set(p, meta);
-    this.cache.set(sha, content);
+    const key = `${this.chatId}/${p}@${stamp()}`;
+    await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: content }));
+    this.latest.set(p, key);
   }
 
-  async edit(path: string, oldStr: string, newStr: string): Promise<void> {
-    const content = await this.read(path);
-    const idx = content.indexOf(oldStr);
-    if (idx === -1) throw new Error(`edit: old_string not found in ${path}`);
-    if (content.indexOf(oldStr, idx + 1) !== -1)
-      throw new Error(`edit: old_string is not unique in ${path}`);
-    await this.write(path, content.replace(oldStr, newStr));
-  }
-
-  /** Synthesizes implicit directories from path prefixes. */
-  ls(dir: string): { name: string; type: "file" | "dir"; size?: number }[] { /* walk this.tree */ }
-
-  /** Both run in-process over the in-memory tree — a chat workspace is small. */
-  find(glob: string): string[] { /* micromatch over tree keys */ }
-  async grep(pattern: string, glob?: string): Promise<GrepMatch[]> {
-    // note: reads (and caches) every candidate blob — fine at workspace scale
+  ls(): string[] {
+    return [...this.latest.keys()].sort();
   }
 }
 ```
 
-`normalize()` is the security boundary: resolve `.`/`..` segments, require
-the result to stay under `/`, reject `\0` etc. ~15 lines, and it's the whole
-"escape prevention" story.
+That's the whole persistence layer. ~55 LoC.
 
-## Store implementations
+## Tools (`src/tools.ts`)
 
-### `src/store/pg.ts`
-
-```ts
-import postgres from "postgres";
-import type { FileMeta, MetaStore } from "../vfs.js";
-
-export function pgMetaStore(sql: postgres.Sql): MetaStore {
-  return {
-    async loadTree(chatId) {
-      return sql<FileMeta[]>`
-        SELECT path, blob_sha AS "blobSha", size, updated_at AS "updatedAt"
-        FROM vfs_files WHERE chat_id = ${chatId}`;
-    },
-    async upsert(chatId, m) {
-      await sql`
-        INSERT INTO vfs_files (chat_id, path, blob_sha, size, updated_at)
-        VALUES (${chatId}, ${m.path}, ${m.blobSha}, ${m.size}, ${m.updatedAt})
-        ON CONFLICT (chat_id, path)
-        DO UPDATE SET blob_sha = EXCLUDED.blob_sha, size = EXCLUDED.size,
-                      updated_at = EXCLUDED.updated_at`;
-    },
-    async remove(chatId, path) {
-      await sql`DELETE FROM vfs_files WHERE chat_id = ${chatId} AND path = ${path}`;
-    },
-  };
-}
-```
-
-### `src/store/s3.ts`
-
-```ts
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import type { BlobStore } from "../vfs.js";
-
-export function s3BlobStore(client: S3Client, bucket: string): BlobStore {
-  const key = (chatId: string, sha: string) => `blobs/${chatId}/${sha}`;
-  return {
-    async get(chatId, sha) {
-      const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key(chatId, sha) }));
-      return res.Body!.transformToByteArray();
-    },
-    async put(chatId, sha, content) {
-      // Immutable + content-addressed: unconditional PUT is safe and idempotent.
-      await client.send(new PutObjectCommand({ Bucket: bucket, Key: key(chatId, sha), Body: content }));
-    },
-  };
-}
-```
-
-The `S3Client` is built in `agent.ts` with **dedicated** `S3_*` credentials
-(endpoint + `forcePathStyle` + access keys), kept separate from the default
-AWS chain that Bedrock uses — otherwise MinIO's keys would clobber Bedrock's.
-Leave `S3_ENDPOINT`/`S3_ACCESS_KEY_ID` unset for real AWS S3 and the client
-falls back to the default chain. `docker compose up` (see `docker-compose.yml`)
-gives you MinIO + the bucket; an `InMemoryBlobStore` (a `Map`) makes tests
-need no infra at all.
-
-```ts
-// agent.ts — S3 client wiring
-const s3 = new S3Client({
-  region: process.env.S3_REGION,
-  endpoint: process.env.S3_ENDPOINT || undefined,          // MinIO for local dev
-  forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
-  credentials: process.env.S3_ACCESS_KEY_ID
-    ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY! }
-    : undefined,                                            // else default AWS chain (real S3)
-});
-```
-
-## Wiring into the Pi session (`src/tools.ts`, `src/agent.ts`)
-
-Disable the built-in file tools, register VFS-backed replacements under the
-**same names** — the model's priors about `read`/`write`/`edit` carry over.
+Four tools, registered under the built-in names (so the model's priors carry
+over) plus `jq`. Built-ins disabled via `noTools: "builtin"`.
 
 ```ts
 import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
-import type { VirtualFs } from "./vfs.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import type { VirtualFs } from "./fs.js";
 
-export function vfsTools(vfs: VirtualFs) {
+const run = promisify(execFile);
+
+export function tools(vfs: VirtualFs) {
   const read = defineTool({
-    name: "read",
-    label: "Read",
+    name: "read", label: "Read",
     description: "Read a file from the workspace",
     parameters: Type.Object({ path: Type.String() }),
     execute: async (_id, { path }) => ({
-      content: [{ type: "text", text: await vfs.read(path) }],
-      details: {},
+      content: [{ type: "text", text: await vfs.read(path) }], details: {},
     }),
   });
 
   const write = defineTool({
-    name: "write",
-    label: "Write",
+    name: "write", label: "Write",
     description: "Create or overwrite a file in the workspace",
     parameters: Type.Object({ path: Type.String(), content: Type.String() }),
     execute: async (_id, { path, content }) => {
@@ -308,58 +143,91 @@ export function vfsTools(vfs: VirtualFs) {
     },
   });
 
-  // edit / ls / grep / find follow the same shape
-  return [read, write /*, edit, ls, grep, find */];
+  const ls = defineTool({
+    name: "ls", label: "List",
+    description: "List files in the workspace",
+    parameters: Type.Object({}),
+    execute: async () => ({
+      content: [{ type: "text", text: vfs.ls().join("\n") || "(empty)" }], details: {},
+    }),
+  });
+
+  // Completely dummy wrapper around the jq binary. Safe despite "no bash":
+  // execFile (no shell) + a single trusted binary + arg array => no injection.
+  // Input is workspace content piped on stdin. Requires `jq` on PATH.
+  const jq = defineTool({
+    name: "jq", label: "jq",
+    description: "Run a jq filter over a JSON file in the workspace",
+    parameters: Type.Object({ path: Type.String(), filter: Type.String() }),
+    execute: async (_id, { path, filter }) => {
+      const input = await vfs.read(path);
+      try {
+        const { stdout } = await run("jq", [filter], { input, maxBuffer: 32 << 20 });
+        return { content: [{ type: "text", text: stdout }], details: {} };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `jq error: ${e.stderr || e.message}` }], details: {} };
+      }
+    },
+  });
+
+  return [read, write, ls, jq];
 }
 ```
 
+## Harness (`src/agent.ts`)
+
+`pi-dev-agent`-style readline REPL. Build the S3 client (dedicated `S3_*`
+creds so MinIO doesn't clobber the AWS chain Bedrock uses — see `.env.sample`),
+hydrate, wire the session.
+
 ```ts
-// per-chat session construction (agent.ts / the future Hono handler)
-const vfs = await VirtualFs.hydrate(chatId, pgMetaStore(sql), s3BlobStore(s3, bucket));
+const s3 = new S3Client({
+  region: process.env.S3_REGION,
+  endpoint: process.env.S3_ENDPOINT || undefined,          // MinIO for local dev
+  forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
+  credentials: process.env.S3_ACCESS_KEY_ID
+    ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY! }
+    : undefined,                                            // else default AWS chain
+});
+
+const chatId = process.argv.includes("--chat")
+  ? process.argv[process.argv.indexOf("--chat") + 1]
+  : "default";
+
+const vfs = await VirtualFs.hydrate(chatId, s3, process.env.S3_BUCKET!);
 
 const { session } = await createAgentSession({
   model,
   resourceLoader,
   sessionManager: SessionManager.inMemory(),
-  noTools: "builtin",          // no real-FS tools, no bash — the whole point
-  customTools: vfsTools(vfs),
-  tools: ["read", "write", "edit", "ls", "grep", "find"],
+  noTools: "builtin",                    // no real-FS tools, no bash — the whole point
+  customTools: tools(vfs),
+  tools: ["read", "write", "ls", "jq"],
 });
+// subscribe to events + readline loop, as in pi-dev-agent/agent.ts
 ```
 
-In `elis-couper` this slots into the existing per-chat session setup: the
-Hono handler already resolves a `chat_id`; `VirtualFs.hydrate` becomes part
-of session construction. Nothing about the AG-UI adapter changes.
+## Concurrency
 
-## Concurrency & lifecycle
+One live session per chat is the assumption. Two concurrent sessions each
+keep their own index; both write non-colliding timestamped versions, and a
+re-`hydrate` reconciles to the true latest. Nothing corrupts — worst case a
+session's in-memory index is briefly behind S3.
 
-- **One live session per chat at a time** is the operating assumption (same
-  as chat semantics generally). Two concurrent sessions on one `chat_id`
-  would last-write-win at the PG row level — not corrupt, just racy. If this
-  ever matters, add `expected_sha` optimistic locking to `upsert`.
-- **Memory**: the session holds the tree + read-blob cache. Workspaces are
-  small (docs + notes, not repos); if a chat someday holds 500 MB of PDFs,
-  cap the cache with LRU eviction — blobs re-fetch from S3 transparently.
-- **Deletion / retention**: drop rows by `chat_id`, lifecycle-expire the
-  `blobs/{chat_id}/` prefix.
+## Deliberately not doing (YAGNI)
+
+- **Postgres / a metadata DB** — `ListObjectsV2` is the metadata.
+- **`edit` / `grep` / `find`** — `read` + `write` + `ls` cover a small
+  workspace; `jq` covers structured JSON (the Rossum case). Add `edit` back
+  the day whole-file rewrites cost too many tokens.
+- **Delete, content cache, dedup, content-addressing, dir-tree synthesis.**
 
 ## What to materialize, in order
 
-1. `src/vfs.ts` — `VirtualFs` + `normalize()` + in-memory stores; unit-test
-   the tree/edit/glob logic with zero infra.
-2. `src/store/pg.ts` + `schema.sql` — against local Postgres.
-3. `src/store/s3.ts` — against MinIO.
-4. `src/tools.ts` + `src/agent.ts` — readline REPL clone of `pi-dev-agent`
-   with `--chat <id>`, proving hydrate → converse → restart → re-hydrate.
-5. Port into `elis-couper`'s session construction.
+1. `src/fs.ts` — `VirtualFs` (stamp, normalize, hydrate, read, write, ls).
+2. `src/tools.ts` — the four tools.
+3. `src/agent.ts` — S3 client + hydrate + session + REPL.
 
-## Open questions
-
-- **Binary files**: tools speak text. Store bytes, expose e.g. base64 or a
-  "binary file, N bytes" stub on `read`? Decide when documents land.
-- **Seeding**: how do uploaded documents enter the VFS — an ingest endpoint
-  writing through the same `VirtualFs.write` path seems right.
-- **History table** (`vfs_file_versions`): cheap to add given content
-  addressing; skip until something needs point-in-time restore.
-- **Size limits**: per-file and per-chat quotas belong in `write` from day
-  one in prod; skip for the experiment.
+Test path: `docker compose up -d minio createbuckets`, then
+`npm start -- --chat demo` → write a file, restart, read it back; write it
+again and confirm a second timestamped object appears in the bucket.

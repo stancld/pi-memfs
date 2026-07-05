@@ -3,27 +3,9 @@
 #
 #   docker compose up -d
 #
-# Ports bind to 127.0.0.1 only. Override with POSTGRES_PORT etc.
+# Ports bind to 127.0.0.1 only. Override with MINIO_PORT etc.
 
 services:
-  postgres:
-    # VFS metadata store. schema.sql is applied on first init.
-    image: postgres:17
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: pi_memfs
-    volumes:
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - 127.0.0.1:${POSTGRES_PORT-5432}:5432
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d pi_memfs"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   minio:
     # VFS blob store (S3-compatible). Console at http://localhost:9001.
     image: minio/minio:RELEASE.2025-05-24T17-08-30Z
@@ -54,5 +36,4 @@ services:
       "
 
 volumes:
-  pgdata:
   miniodata:

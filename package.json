@@ -14,8 +14,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",
     "@earendil-works/pi-ai": "^0.80.3",
-    "@earendil-works/pi-coding-agent": "^0.80.3",
-    "postgres": "^3.4.9"
+    "@earendil-works/pi-coding-agent": "^0.80.3"
   },
   "devDependencies": {
     "prettier": "^3.8.3",
