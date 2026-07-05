@@ -18,8 +18,6 @@ const WORKSPACE_ROOT = "/workspace";
 const wsPath = (absolutePath: string) => relative(WORKSPACE_ROOT, absolutePath);
 
 export function tools(vfs: VirtualFs) {
-  // Native read tool (offset/limit + 2000-line/50KB truncation) over the
-  // in-memory workspace instead of disk — no wheel reinvented.
   const read = createReadToolDefinition(WORKSPACE_ROOT, {
     autoResizeImages: false,
     operations: {
@@ -30,11 +28,10 @@ export function tools(vfs: VirtualFs) {
     },
   });
 
-  // Native write tool over the workspace. Flat keyspace → mkdir is a no-op.
   const write = createWriteToolDefinition(WORKSPACE_ROOT, {
     operations: {
       writeFile: async (abs, content) => vfs.write(wsPath(abs), content),
-      mkdir: async () => {},
+      mkdir: async () => {}, // flat keyspace → no directories to create
     },
   });
 
